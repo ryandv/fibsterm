@@ -9,6 +9,10 @@ use std::io::prelude::*;
 use std::net;
 use std::result;
 
+extern crate termion;
+
+use termion::raw::IntoRawMode;
+
 static DEFAULT_FIBS_SERVER: &str = "fibs.com";
 const DEFAULT_FIBS_PORT: u16 = 4321;
 
@@ -80,6 +84,8 @@ fn resolvev4(hostname: String, port: u16) -> Result<net::SocketAddrV4> {
 }
 
 fn main() -> Result<()> {
+    let mut stdout = io::stdout().into_raw_mode()?;
+
     let fibs_hostname = env::vars()
         .find(|(_envar, val)| val == "FIBS_HOSTNAME")
         .map(|(_envar, val)| val)
@@ -92,9 +98,13 @@ fn main() -> Result<()> {
     let fibs_addrv4 = resolvev4(fibs_hostname, fibs_port)?;
 
     let mut payload: [u8; 930] = [0; 930];
-    let mut tcp = net::TcpStream::connect(fibs_addrv4)?;
-    tcp.read_exact(&mut payload)?;
-    println!("{}", String::from_utf8_lossy(&payload));
+
+    {
+        let mut tcp = net::TcpStream::connect(fibs_addrv4)?;
+        tcp.read_exact(&mut payload)?;
+    }
+
+    write!(stdout, "{}{}{}", termion::clear::All, termion::cursor::Goto(1, 1), String::from_utf8_lossy(&payload))?;
 
     Ok(())
 }
