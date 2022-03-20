@@ -16,6 +16,7 @@ use std::io::prelude::*;
 
 extern crate termion;
 
+use termion::cursor::DetectCursorPos;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 
@@ -36,6 +37,8 @@ struct State {
 
 enum Update {
     MOTD(String),
+    AppendChars(String),
+    Input(String),
 }
 
 enum FibsState {
@@ -142,7 +145,7 @@ fn spawn_fibs_thread(mut tcp: net::TcpStream, tx: sync::mpsc::SyncSender<u8>) ->
     }))
 }
 
-fn spawn_input_thread(mut tcp: net::TcpStream) -> Result<thread::JoinHandle<Result<()>>> {
+fn spawn_input_thread(mut tcp: net::TcpStream, updates_tx: sync::mpsc::Sender<Update>) -> Result<thread::JoinHandle<Result<()>>> {
     Ok(thread::spawn(move || -> Result<()> {
         let stdin = io::stdin();
         let mut ln = String::new();
@@ -156,6 +159,15 @@ fn spawn_input_thread(mut tcp: net::TcpStream) -> Result<thread::JoinHandle<Resu
                         let n = tcp.write(&payload)?;
                         ln.clear();
                     } else {
+                        let mut s = String::new();
+                        s.push(c);
+
+                        let chars_update = Update::AppendChars(s.clone());
+                        updates_tx.send(chars_update)?;
+
+                        let input_update = Update::Input(s);
+                        updates_tx.send(input_update)?;
+
                         ln.push(c);
                     }
                 }
@@ -172,20 +184,33 @@ fn spawn_input_thread(mut tcp: net::TcpStream) -> Result<thread::JoinHandle<Resu
 
 fn spawn_tui_thread() -> Result<(sync::mpsc::Sender<Update>, thread::JoinHandle<Result<()>>)> {
     let (updates_tx, updates_rx) = sync::mpsc::channel::<Update>();
-    let motd_width = 80;
+    let view_width = 80;
 
     let h = thread::spawn(move || {
         let mut stdout = io::stdout();
         write!(stdout, "{}{}", termion::clear::All, termion::cursor::Goto(1, 3))?;
-        write!(stdout, "╔═MOTD{}╗", String::from("═").repeat(motd_width - 5))?;
+        write!(stdout, "╔═FIBS{}╗", String::from("═").repeat(view_width - 5))?;
 
         for row in 4..25 {
             write!(stdout, "{}", termion::cursor::Goto(1, row))?;
-            write!(stdout, "║{}║", String::from(" ").repeat(motd_width))?;
+            write!(stdout, "║{}║", String::from(" ").repeat(view_width))?;
         }
 
         write!(stdout, "{}", termion::cursor::Goto(1, 25))?;
-        write!(stdout, "╚{}╝", String::from("═").repeat(motd_width))?;
+        write!(stdout, "╚{}╝", String::from("═").repeat(view_width))?;
+
+        write!(stdout, "{}", termion::cursor::Goto(1, 26))?;
+        write!(stdout, "╔═INPUT{}╗", String::from("═").repeat(view_width - 6))?;
+
+        write!(stdout, "{}", termion::cursor::Goto(1, 27))?;
+        write!(stdout, "║ > {}║", String::from(" ").repeat(view_width - 3))?;
+
+        write!(stdout, "{}", termion::cursor::Goto(1, 28))?;
+        write!(stdout, "╚{}╝", String::from("═").repeat(view_width))?;
+
+        // termion's cursor_pos() panics....
+        let mut fibs_cursor_pos: (u16, u16) = (3, 4);
+        let mut input_cursor_pos: (u16, u16) = (5, 27);
 
         loop {
             let next = updates_rx.recv()?;
@@ -196,11 +221,14 @@ fn spawn_tui_thread() -> Result<(sync::mpsc::Sender<Update>, thread::JoinHandle<
                         .chars()
                         .fold(String::new(), |mut s, c| {
                             if c == '\r' {
-                                s.extend(format!("{}", termion::cursor::Goto(2, row)).chars());
+                                s.extend(format!("{}", termion::cursor::Goto(3, row)).chars());
+                                fibs_cursor_pos.0 = 3;
                             } else if c == '\n' {
                                 s.extend(format!("{}", termion::cursor::Down(1)).chars());
                                 row = row + 1;
+                                fibs_cursor_pos.1 = fibs_cursor_pos.1 + 1;
                             } else {
+                                fibs_cursor_pos.0 = fibs_cursor_pos.0 + 1;
                                 s.push(c);
                             }
                             s
@@ -208,7 +236,19 @@ fn spawn_tui_thread() -> Result<(sync::mpsc::Sender<Update>, thread::JoinHandle<
 
                     write!(stdout, "{}", termion::cursor::Goto(2, 4))?;
                     write!(stdout, "{}", tui_motd)?;
-                    io::stdout().flush()?;
+                    io::stdout().flush().unwrap();
+                }
+                Update::AppendChars(s) => {
+                    write!(stdout, "{}", termion::cursor::Goto(fibs_cursor_pos.0, fibs_cursor_pos.1))?;
+                    write!(stdout, "{}", s)?;
+                    fibs_cursor_pos.0 = fibs_cursor_pos.0 + s.len() as u16;
+                    io::stdout().flush().unwrap();
+                }
+                Update::Input(s) => {
+                    write!(stdout, "{}", termion::cursor::Goto(input_cursor_pos.0, input_cursor_pos.1))?;
+                    write!(stdout, "{}", s)?;
+                    input_cursor_pos.0 = input_cursor_pos.0 + s.len() as u16;
+                    io::stdout().flush().unwrap();
                 }
             }
         }
@@ -273,7 +313,7 @@ fn main() -> Result<()> {
     // need barriers soon
     let fibs_handle = spawn_fibs_thread(reading_tcp, tcp_tx.clone())?;
     let (updates_tx, tui_handle) = spawn_tui_thread()?;
-    let input_handle = spawn_input_thread(writing_tcp)?;
+    let input_handle = spawn_input_thread(writing_tcp, updates_tx.clone())?;
 
     loop {
         match tcp_rx.try_recv() {
@@ -311,17 +351,20 @@ fn main() -> Result<()> {
                         // hit password prompt...
                         if s == 20 {
                             state.fibs_state = FibsState::WaitPassword;
+                            let update = Update::AppendChars(String::from("\npassword: "));
+                            updates_tx.send(update)?;
                             buf.clear();
                         }
                     }
                     FibsState::WaitPassword => {
+                        break;
                     }
                 }
             }
             Err(sync::mpsc::TryRecvError::Empty) => {
                 continue;
             }
-            Err(e @ sync::mpsc::TryRecvError::Disconnected) => { return Err(Error::from(e)); }
+            Err(e @ sync::mpsc::TryRecvError::Disconnected) => { break; }
         }
     }
 
