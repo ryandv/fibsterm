@@ -16,6 +16,7 @@ use std::io::prelude::*;
 
 extern crate termion;
 
+use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 
 static DEFAULT_FIBS_SERVER: &str = "fibs.com";
@@ -40,6 +41,7 @@ enum Update {
 enum FibsState {
     MOTD = 0,
     WaitLogin,
+    WaitPassword,
 }
 
 type Result<T> = result::Result<T, Error>;
@@ -127,7 +129,7 @@ fn resolvev4(hostname: String, port: u16) -> Result<net::SocketAddrV4> {
 }
 
 fn spawn_fibs_thread(mut tcp: net::TcpStream, tx: sync::mpsc::SyncSender<u8>) -> Result<thread::JoinHandle<Result<()>>> {
-    let h = thread::spawn(move || -> Result<()> {
+    Ok(thread::spawn(move || -> Result<()> {
         let mut buf = [0; 4096];
 
         loop {
@@ -137,8 +139,35 @@ fn spawn_fibs_thread(mut tcp: net::TcpStream, tx: sync::mpsc::SyncSender<u8>) ->
                 tx.send(buf[i])?;
             };
         }
-    });
-    Ok(h)
+    }))
+}
+
+fn spawn_input_thread(mut tcp: net::TcpStream) -> Result<thread::JoinHandle<Result<()>>> {
+    Ok(thread::spawn(move || -> Result<()> {
+        let stdin = io::stdin();
+        let mut ln = String::new();
+
+        for k in stdin.keys() {
+            match k {
+                Ok(termion::event::Key::Char(c)) => {
+                    if c == '\n' {
+                        ln.push('\r');
+                        let payload = ln.as_bytes();
+                        let n = tcp.write(&payload)?;
+                        ln.clear();
+                    } else {
+                        ln.push(c);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(e.into());
+                }
+            }
+        }
+
+        Ok(())
+    }))
 }
 
 fn spawn_tui_thread() -> Result<(sync::mpsc::Sender<Update>, thread::JoinHandle<Result<()>>)> {
@@ -201,8 +230,9 @@ fn main() -> Result<()> {
         .unwrap_or(DEFAULT_FIBS_PORT);
 
     let fibs_addr = resolvev4(fibs_hostname, fibs_port)?;
-    let writing_tcp = net::TcpStream::connect(fibs_addr)?;
-    let reading_tcp = writing_tcp.try_clone()?;
+    let tcp = net::TcpStream::connect(fibs_addr)?;
+    let reading_tcp = tcp.try_clone()?;
+    let writing_tcp = tcp.try_clone()?;
 
     let (tcp_tx, tcp_rx) = sync::mpsc::sync_channel::<u8>(4096);
     let mut state = State {
@@ -227,10 +257,23 @@ fn main() -> Result<()> {
     delta.insert(8, (2, collections::HashMap::from([(':' as u8, 9)])));
     delta.insert(9, (2, collections::HashMap::from([(' ' as u8, 10)])));
 
+    delta.insert(10, (2, collections::HashMap::from([('p' as u8, 11)])));
+    delta.insert(11, (2, collections::HashMap::from([('a' as u8, 12)])));
+    delta.insert(12, (2, collections::HashMap::from([('s' as u8, 13)])));
+    delta.insert(13, (2, collections::HashMap::from([('s' as u8, 14)])));
+    delta.insert(14, (2, collections::HashMap::from([('w' as u8, 15)])));
+    delta.insert(15, (2, collections::HashMap::from([('o' as u8, 16)])));
+    delta.insert(16, (2, collections::HashMap::from([('r' as u8, 17)])));
+    delta.insert(17, (2, collections::HashMap::from([('d' as u8, 18)])));
+    delta.insert(18, (2, collections::HashMap::from([(':' as u8, 19)])));
+    delta.insert(19, (2, collections::HashMap::from([(' ' as u8, 20)])));
+
     let mut s: u8 = 0;
 
+    // need barriers soon
     let fibs_handle = spawn_fibs_thread(reading_tcp, tcp_tx.clone())?;
     let (updates_tx, tui_handle) = spawn_tui_thread()?;
+    let input_handle = spawn_input_thread(writing_tcp)?;
 
     loop {
         match tcp_rx.try_recv() {
@@ -259,7 +302,19 @@ fn main() -> Result<()> {
                         }
                     }
                     FibsState::WaitLogin => {
-                        break;
+                        s = delta
+                            .get(&s)
+                            .and_then(|(default, d)| d.get(&b).or_else(|| Some(default)))
+                            .map(|byte| *byte)
+                            .unwrap_or(0);
+
+                        // hit password prompt...
+                        if s == 20 {
+                            state.fibs_state = FibsState::WaitPassword;
+                            buf.clear();
+                        }
+                    }
+                    FibsState::WaitPassword => {
                     }
                 }
             }
@@ -270,7 +325,7 @@ fn main() -> Result<()> {
         }
     }
 
-    writing_tcp.shutdown(net::Shutdown::Both)?;
+    tcp.shutdown(net::Shutdown::Both)?;
     stdout.suspend_raw_mode()?;
 
     fibs_handle.join().unwrap_or_else(|_| {
@@ -281,6 +336,12 @@ fn main() -> Result<()> {
 
     tui_handle.join().unwrap_or_else(|_| {
         write!(stdout, "tui thread panicked")?;
+        stdout.flush()?;
+        Ok(())
+    })?;
+
+    input_handle.join().unwrap_or_else(|_| {
+        write!(stdout, "input thread panicked")?;
         stdout.flush()?;
         Ok(())
     })?;
