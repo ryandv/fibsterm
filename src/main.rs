@@ -30,8 +30,11 @@ enum Error {
 }
 
 struct State {
-    raw_feed: String,
     fibs_state: FibsState,
+}
+
+enum Update {
+    MOTD(String),
 }
 
 enum FibsState {
@@ -138,21 +141,24 @@ fn spawn_fibs_thread(mut tcp: net::TcpStream, tx: sync::mpsc::SyncSender<u8>) ->
     Ok(h)
 }
 
-fn spawn_tui_thread(arc: sync::Arc<(sync::Mutex<State>, sync::Condvar)>) -> Result<thread::JoinHandle<Result<()>>> {
+fn spawn_tui_thread() -> Result<(sync::mpsc::Sender<Update>, thread::JoinHandle<Result<()>>)> {
+    let (updates_tx, updates_rx) = sync::mpsc::channel::<Update>();
+
     let h = thread::spawn(move || {
-        let (lock, cvar) = &*arc;
         let mut stdout = io::stdout();
-        let mut next = lock.lock()?;
 
         loop {
-            write!(stdout, "{}{}{}", termion::clear::All, termion::cursor::Goto(1, 1), next.raw_feed)?;
-            io::stdout().flush()?;
-
-            next = cvar.wait(next)?;
+            let next = updates_rx.recv()?;
+            match next {
+                Update::MOTD(motd) => {
+                    write!(stdout, "{}{}{}", termion::clear::All, termion::cursor::Goto(1, 1), motd)?;
+                    io::stdout().flush()?;
+                }
+            }
         }
     });
 
-    Ok(h)
+    Ok((updates_tx, h))
 }
 
 fn main() -> Result<()> {
@@ -172,14 +178,9 @@ fn main() -> Result<()> {
     let reading_tcp = writing_tcp.try_clone()?;
 
     let (tcp_tx, tcp_rx) = sync::mpsc::sync_channel::<u8>(4096);
-    let state = State {
-        raw_feed: String::from(""),
+    let mut state = State {
         fibs_state: FibsState::MOTD,
     };
-    let state_lock = sync::Mutex::new(state);
-    let state_condvar = sync::Condvar::new();
-    let arc = sync::Arc::new((state_lock, state_condvar));
-    let arc2 = sync::Arc::clone(&arc);
 
     let mut buf = collections::VecDeque::with_capacity(4096);
     let mut delta = collections::HashMap::<u8, collections::HashMap::<u8, u8>>::new();
@@ -194,14 +195,11 @@ fn main() -> Result<()> {
     let mut s: u8 = 0;
 
     let fibs_handle = spawn_fibs_thread(reading_tcp, tcp_tx.clone())?;
-    let tui_handle = spawn_tui_thread(arc2)?;
+    let (updates_tx, tui_handle) = spawn_tui_thread()?;
 
     loop {
-        let (state_lock, state_condvar) = &*arc;
         match tcp_rx.try_recv() {
             Ok(b) => {
-                let mut state = state_lock.lock()?;
-
                 match state.fibs_state {
                     FibsState::MOTD => {
                         buf.push_back(b);
@@ -213,9 +211,11 @@ fn main() -> Result<()> {
                             .unwrap_or(0);
 
                         if s == 7 {
-                            state.raw_feed = String::from_utf8_lossy(buf.make_contiguous()).into_owned();
                             state.fibs_state = FibsState::WaitLogin;
-                            state_condvar.notify_all();
+
+                            let update = Update::MOTD(String::from_utf8_lossy(buf.make_contiguous()).into_owned());
+                            updates_tx.send(update)?;
+
                             buf.clear();
                         }
                     }
