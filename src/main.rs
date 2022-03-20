@@ -2,7 +2,16 @@ use libc;
 
 use core::ptr;
 
-use std::{ env, ffi, io, sync, net, result, thread };
+use std::{
+    collections,
+    env,
+    ffi,
+    io,
+    sync,
+    net,
+    result,
+    thread
+};
 use std::io::prelude::*;
 
 extern crate termion;
@@ -18,6 +27,11 @@ enum Error {
     MalformedInputError(String),
     GAIError(String),
     SyncError(String),
+}
+
+enum FibsState {
+    MOTD = 0,
+    WaitLogin,
 }
 
 type Result<T> = result::Result<T, Error>;
@@ -126,40 +140,63 @@ fn main() -> Result<()> {
         .unwrap_or(DEFAULT_FIBS_PORT);
 
     let fibs_addr = resolvev4(fibs_hostname, fibs_port)?;
-    let tcp = net::TcpStream::connect(fibs_addr)?;
-    let tcp2 = tcp.try_clone()?;
+    let writing_tcp = net::TcpStream::connect(fibs_addr)?;
+    let reading_tcp = writing_tcp.try_clone()?;
 
-    let (tx, rx) = sync::mpsc::sync_channel::<u8>(4096);
+    let (r_tx, r_rx) = sync::mpsc::sync_channel::<u8>(4096);
+    let (w_tx, w_rx) = sync::mpsc::sync_channel::<u8>(4096);
 
-    let fibs_handle = spawn_fibs_thread(tcp2, tx.clone())?;
+    let fibs_handle = spawn_fibs_thread(reading_tcp, r_tx.clone())?;
 
-    let mut payload = [0; 4096];
-    {
-        let mut i = 0;
+    let mut buf = collections::VecDeque::with_capacity(4096);
+    let mut state = FibsState::MOTD;
+    // 0 ---6c--> 1 ---6f--> 2 ---67--> 3 ---69--> 4 ---6e--> 5 ---3a--> 6 ---20--> 7
+    let mut delta = collections::HashMap::<u8, collections::HashMap::<u8, u8>>::new();
+    delta.insert(0, collections::HashMap::from([(0x0a, 1)]));
+    delta.insert(1, collections::HashMap::from([(0x6c, 2)]));
+    delta.insert(2, collections::HashMap::from([(0x6f, 3)]));
+    delta.insert(3, collections::HashMap::from([(0x67, 4)]));
+    delta.insert(4, collections::HashMap::from([(0x69, 5)]));
+    delta.insert(5, collections::HashMap::from([(0x6e, 6)]));
+    delta.insert(6, collections::HashMap::from([(0x3a, 7)]));
+    delta.insert(7, collections::HashMap::from([(0x20, 8)]));
+    let mut s: u8 = 0;
 
-        loop {
+    loop {
+        match r_rx.try_recv() {
+            Ok(b) => {
+                match state {
+                    FibsState::MOTD => {
+                        buf.push_back(b);
 
-            match rx.try_recv() {
-                Ok(b) => {
-                    payload[i] = b;
-                    i = i + 1;
-                }
-                Err(sync::mpsc::TryRecvError::Empty) => {
-                    if i >= 855 {
+                        s = delta
+                            .get(&s)
+                            .and_then(|d| d.get(&b))
+                            .map(|byte| *byte)
+                            .unwrap_or(0);
+
+                        if s == 7 {
+                            state = FibsState::WaitLogin;
+                        }
+                    }
+                    FibsState::WaitLogin => {
+                        buf.push_back(' ' as u8);
+                        buf.push_back('_' as u8);
                         break;
                     }
-
-                    continue;
                 }
-                Err(e @ sync::mpsc::TryRecvError::Disconnected) => { return Err(Error::from(e)); }
             }
+            Err(sync::mpsc::TryRecvError::Empty) => {
+                continue;
+            }
+            Err(e @ sync::mpsc::TryRecvError::Disconnected) => { return Err(Error::from(e)); }
         }
     }
 
-    write!(stdout, "{}{}{}", termion::clear::All, termion::cursor::Goto(1, 1), String::from_utf8_lossy(&payload))?;
+    write!(stdout, "{}{}{}", termion::clear::All, termion::cursor::Goto(1, 1), String::from_utf8_lossy(buf.make_contiguous()))?;
     stdout.flush()?;
 
-    tcp.shutdown(net::Shutdown::Both)?;
+    writing_tcp.shutdown(net::Shutdown::Both)?;
     stdout.suspend_raw_mode()?;
 
     match fibs_handle.join() {
