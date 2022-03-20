@@ -29,6 +29,11 @@ enum Error {
     SyncError(String),
 }
 
+struct State {
+    raw_feed: String,
+    fibs_state: FibsState,
+}
+
 enum FibsState {
     MOTD = 0,
     WaitLogin,
@@ -78,8 +83,14 @@ impl From<sync::mpsc::RecvError> for Error {
     }
 }
 
-impl From<sync::mpsc::SendError<u8>> for Error {
-    fn from(_: sync::mpsc::SendError<u8>) -> Error {
+impl<T> From<sync::mpsc::SendError<T>> for Error {
+    fn from(_: sync::mpsc::SendError<T>) -> Error {
+        Error::SyncError(String::from("tui thread disconnected"))
+    }
+}
+
+impl<T> From<sync::PoisonError<T>> for Error {
+    fn from(_: sync::PoisonError<T>) -> Error {
         Error::SyncError(String::from("tui thread disconnected"))
     }
 }
@@ -127,6 +138,23 @@ fn spawn_fibs_thread(mut tcp: net::TcpStream, tx: sync::mpsc::SyncSender<u8>) ->
     Ok(h)
 }
 
+fn spawn_tui_thread(arc: sync::Arc<(sync::Mutex<State>, sync::Condvar)>) -> Result<thread::JoinHandle<Result<()>>> {
+    let h = thread::spawn(move || {
+        let (lock, cvar) = &*arc;
+        let mut stdout = io::stdout();
+        let mut next = lock.lock()?;
+
+        loop {
+            write!(stdout, "{}{}{}", termion::clear::All, termion::cursor::Goto(1, 1), next.raw_feed)?;
+            io::stdout().flush()?;
+
+            next = cvar.wait(next)?;
+        }
+    });
+
+    Ok(h)
+}
+
 fn main() -> Result<()> {
     let mut stdout = io::stdout().into_raw_mode()?;
 
@@ -143,14 +171,17 @@ fn main() -> Result<()> {
     let writing_tcp = net::TcpStream::connect(fibs_addr)?;
     let reading_tcp = writing_tcp.try_clone()?;
 
-    let (r_tx, r_rx) = sync::mpsc::sync_channel::<u8>(4096);
-    let (w_tx, w_rx) = sync::mpsc::sync_channel::<u8>(4096);
-
-    let fibs_handle = spawn_fibs_thread(reading_tcp, r_tx.clone())?;
+    let (tcp_tx, tcp_rx) = sync::mpsc::sync_channel::<u8>(4096);
+    let state = State {
+        raw_feed: String::from(""),
+        fibs_state: FibsState::MOTD,
+    };
+    let state_lock = sync::Mutex::new(state);
+    let state_condvar = sync::Condvar::new();
+    let arc = sync::Arc::new((state_lock, state_condvar));
+    let arc2 = sync::Arc::clone(&arc);
 
     let mut buf = collections::VecDeque::with_capacity(4096);
-    let mut state = FibsState::MOTD;
-    // 0 ---6c--> 1 ---6f--> 2 ---67--> 3 ---69--> 4 ---6e--> 5 ---3a--> 6 ---20--> 7
     let mut delta = collections::HashMap::<u8, collections::HashMap::<u8, u8>>::new();
     delta.insert(0, collections::HashMap::from([(0x0a, 1)]));
     delta.insert(1, collections::HashMap::from([(0x6c, 2)]));
@@ -162,10 +193,16 @@ fn main() -> Result<()> {
     delta.insert(7, collections::HashMap::from([(0x20, 8)]));
     let mut s: u8 = 0;
 
+    let fibs_handle = spawn_fibs_thread(reading_tcp, tcp_tx.clone())?;
+    let tui_handle = spawn_tui_thread(arc2)?;
+
     loop {
-        match r_rx.try_recv() {
+        let (state_lock, state_condvar) = &*arc;
+        match tcp_rx.try_recv() {
             Ok(b) => {
-                match state {
+                let mut state = state_lock.lock()?;
+
+                match state.fibs_state {
                     FibsState::MOTD => {
                         buf.push_back(b);
 
@@ -176,12 +213,13 @@ fn main() -> Result<()> {
                             .unwrap_or(0);
 
                         if s == 7 {
-                            state = FibsState::WaitLogin;
+                            state.raw_feed = String::from_utf8_lossy(buf.make_contiguous()).into_owned();
+                            state.fibs_state = FibsState::WaitLogin;
+                            state_condvar.notify_all();
+                            buf.clear();
                         }
                     }
                     FibsState::WaitLogin => {
-                        buf.push_back(' ' as u8);
-                        buf.push_back('_' as u8);
                         break;
                     }
                 }
@@ -193,18 +231,20 @@ fn main() -> Result<()> {
         }
     }
 
-    write!(stdout, "{}{}{}", termion::clear::All, termion::cursor::Goto(1, 1), String::from_utf8_lossy(buf.make_contiguous()))?;
-    stdout.flush()?;
-
     writing_tcp.shutdown(net::Shutdown::Both)?;
     stdout.suspend_raw_mode()?;
 
-    match fibs_handle.join() {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            write!(stdout, "fibs thread panicked")?;
-            stdout.flush()?;
-            Ok(())
-        }
-    }
+    fibs_handle.join().unwrap_or_else(|_| {
+        write!(stdout, "fibs thread panicked")?;
+        stdout.flush()?;
+        Ok(())
+    })?;
+
+    tui_handle.join().unwrap_or_else(|_| {
+        write!(stdout, "tui thread panicked")?;
+        stdout.flush()?;
+        Ok(())
+    })?;
+
+    Ok(())
 }
