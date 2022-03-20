@@ -143,15 +143,42 @@ fn spawn_fibs_thread(mut tcp: net::TcpStream, tx: sync::mpsc::SyncSender<u8>) ->
 
 fn spawn_tui_thread() -> Result<(sync::mpsc::Sender<Update>, thread::JoinHandle<Result<()>>)> {
     let (updates_tx, updates_rx) = sync::mpsc::channel::<Update>();
+    let motd_width = 80;
 
     let h = thread::spawn(move || {
         let mut stdout = io::stdout();
+        write!(stdout, "{}{}", termion::clear::All, termion::cursor::Goto(1, 3))?;
+        write!(stdout, "╔═MOTD{}╗", String::from("═").repeat(motd_width - 5))?;
+
+        for row in 4..25 {
+            write!(stdout, "{}", termion::cursor::Goto(1, row))?;
+            write!(stdout, "║{}║", String::from(" ").repeat(motd_width))?;
+        }
+
+        write!(stdout, "{}", termion::cursor::Goto(1, 25))?;
+        write!(stdout, "╚{}╝", String::from("═").repeat(motd_width))?;
 
         loop {
             let next = updates_rx.recv()?;
             match next {
                 Update::MOTD(motd) => {
-                    write!(stdout, "{}{}{}", termion::clear::All, termion::cursor::Goto(1, 1), motd)?;
+                    let mut row = 4;
+                    let tui_motd: String = motd
+                        .chars()
+                        .fold(String::new(), |mut s, c| {
+                            if c == '\r' {
+                                s.extend(format!("{}", termion::cursor::Goto(2, row)).chars());
+                            } else if c == '\n' {
+                                s.extend(format!("{}", termion::cursor::Down(1)).chars());
+                                row = row + 1;
+                            } else {
+                                s.push(c);
+                            }
+                            s
+                        });
+
+                    write!(stdout, "{}", termion::cursor::Goto(2, 4))?;
+                    write!(stdout, "{}", tui_motd)?;
                     io::stdout().flush()?;
                 }
             }
@@ -183,15 +210,23 @@ fn main() -> Result<()> {
     };
 
     let mut buf = collections::VecDeque::with_capacity(4096);
-    let mut delta = collections::HashMap::<u8, collections::HashMap::<u8, u8>>::new();
-    delta.insert(0, collections::HashMap::from([(0x0a, 1)]));
-    delta.insert(1, collections::HashMap::from([(0x6c, 2)]));
-    delta.insert(2, collections::HashMap::from([(0x6f, 3)]));
-    delta.insert(3, collections::HashMap::from([(0x67, 4)]));
-    delta.insert(4, collections::HashMap::from([(0x69, 5)]));
-    delta.insert(5, collections::HashMap::from([(0x6e, 6)]));
-    delta.insert(6, collections::HashMap::from([(0x3a, 7)]));
-    delta.insert(7, collections::HashMap::from([(0x20, 8)]));
+
+    let mut delta = collections::HashMap::<u8, (u8, collections::HashMap::<u8, u8>)>::new();
+
+    delta.insert(0, (0, collections::HashMap::from([(0x0d, 1)])));
+    delta.insert(1, (0, collections::HashMap::from([(0x0a, 2)])));
+
+    // reading motd...
+    delta.insert(2, (2, collections::HashMap::from([(0x0a, 3)])));
+
+    delta.insert(3, (2, collections::HashMap::from([('l' as u8, 4)])));
+    delta.insert(4, (2, collections::HashMap::from([('o' as u8, 5)])));
+    delta.insert(5, (2, collections::HashMap::from([('g' as u8, 6)])));
+    delta.insert(6, (2, collections::HashMap::from([('i' as u8, 7)])));
+    delta.insert(7, (2, collections::HashMap::from([('n' as u8, 8)])));
+    delta.insert(8, (2, collections::HashMap::from([(':' as u8, 9)])));
+    delta.insert(9, (2, collections::HashMap::from([(' ' as u8, 10)])));
+
     let mut s: u8 = 0;
 
     let fibs_handle = spawn_fibs_thread(reading_tcp, tcp_tx.clone())?;
@@ -202,15 +237,19 @@ fn main() -> Result<()> {
             Ok(b) => {
                 match state.fibs_state {
                     FibsState::MOTD => {
-                        buf.push_back(b);
+                        // chomp leading whitespace...
+                        if s > 1 {
+                            buf.push_back(b);
+                        }
 
                         s = delta
                             .get(&s)
-                            .and_then(|d| d.get(&b))
+                            .and_then(|(default, d)| d.get(&b).or_else(|| Some(default)))
                             .map(|byte| *byte)
                             .unwrap_or(0);
 
-                        if s == 7 {
+                        // hit login prompt...
+                        if s == 10 {
                             state.fibs_state = FibsState::WaitLogin;
 
                             let update = Update::MOTD(String::from_utf8_lossy(buf.make_contiguous()).into_owned());
