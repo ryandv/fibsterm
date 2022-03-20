@@ -2,12 +2,8 @@ use libc;
 
 use core::ptr;
 
-use std::env;
-use std::ffi;
-use std::io;
+use std::{ env, ffi, io, sync, net, result, thread };
 use std::io::prelude::*;
-use std::net;
-use std::result;
 
 extern crate termion;
 
@@ -21,6 +17,7 @@ enum Error {
     IOError(String),
     MalformedInputError(String),
     GAIError(String),
+    SyncError(String),
 }
 
 type Result<T> = result::Result<T, Error>;
@@ -55,6 +52,24 @@ impl From<libc::c_int> for Error {
     }
 }
 
+impl From<sync::mpsc::TryRecvError> for Error {
+    fn from(_: sync::mpsc::TryRecvError) -> Error {
+        Error::SyncError(String::from("fibs thread disconnected"))
+    }
+}
+
+impl From<sync::mpsc::RecvError> for Error {
+    fn from(_: sync::mpsc::RecvError) -> Error {
+        Error::SyncError(String::from("fibs thread disconnected"))
+    }
+}
+
+impl From<sync::mpsc::SendError<u8>> for Error {
+    fn from(_: sync::mpsc::SendError<u8>) -> Error {
+        Error::SyncError(String::from("tui thread disconnected"))
+    }
+}
+
 fn resolvev4(hostname: String, port: u16) -> Result<net::SocketAddrV4> {
     let c_hostname = ffi::CString::new(hostname)?;
     let c_port = ffi::CString::new(port.to_string())?;
@@ -83,6 +98,21 @@ fn resolvev4(hostname: String, port: u16) -> Result<net::SocketAddrV4> {
     }
 }
 
+fn spawn_fibs_thread(mut tcp: net::TcpStream, tx: sync::mpsc::SyncSender<u8>) -> Result<thread::JoinHandle<Result<()>>> {
+    let h = thread::spawn(move || -> Result<()> {
+        let mut buf = [0; 4096];
+
+        loop {
+            let n = tcp.read(&mut buf)?;
+
+            for i in 0..n {
+                tx.send(buf[i])?;
+            };
+        }
+    });
+    Ok(h)
+}
+
 fn main() -> Result<()> {
     let mut stdout = io::stdout().into_raw_mode()?;
 
@@ -95,16 +125,49 @@ fn main() -> Result<()> {
         .and_then(|(_envar, val)| val.parse().ok())
         .unwrap_or(DEFAULT_FIBS_PORT);
 
-    let fibs_addrv4 = resolvev4(fibs_hostname, fibs_port)?;
+    let fibs_addr = resolvev4(fibs_hostname, fibs_port)?;
+    let tcp = net::TcpStream::connect(fibs_addr)?;
+    let tcp2 = tcp.try_clone()?;
 
-    let mut payload: [u8; 930] = [0; 930];
+    let (tx, rx) = sync::mpsc::sync_channel::<u8>(4096);
 
+    let fibs_handle = spawn_fibs_thread(tcp2, tx.clone())?;
+
+    let mut payload = [0; 4096];
     {
-        let mut tcp = net::TcpStream::connect(fibs_addrv4)?;
-        tcp.read_exact(&mut payload)?;
+        let mut i = 0;
+
+        loop {
+
+            match rx.try_recv() {
+                Ok(b) => {
+                    payload[i] = b;
+                    i = i + 1;
+                }
+                Err(sync::mpsc::TryRecvError::Empty) => {
+                    if i >= 855 {
+                        break;
+                    }
+
+                    continue;
+                }
+                Err(e @ sync::mpsc::TryRecvError::Disconnected) => { return Err(Error::from(e)); }
+            }
+        }
     }
 
     write!(stdout, "{}{}{}", termion::clear::All, termion::cursor::Goto(1, 1), String::from_utf8_lossy(&payload))?;
+    stdout.flush()?;
 
-    Ok(())
+    tcp.shutdown(net::Shutdown::Both)?;
+    stdout.suspend_raw_mode()?;
+
+    match fibs_handle.join() {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            write!(stdout, "fibs thread panicked")?;
+            stdout.flush()?;
+            Ok(())
+        }
+    }
 }
