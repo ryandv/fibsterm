@@ -183,37 +183,60 @@ fn spawn_input_thread(mut tcp: net::TcpStream, updates_tx: sync::mpsc::Sender<Up
     }))
 }
 
+fn redraw_fibs_buffer(fibs_buffer: &Vec<&String>) -> Result<(u16, u16)> {
+    let mut stdout = io::stdout();
+    let view_width = 73;
+    let mut row: u16 = 3;
+    let mut col: u16 = 3;
+    let tui_motd = fibs_buffer
+        .into_iter()
+        .fold(String::new(), |mut s, ln| {
+            row = row + 1;
+            col = 3 + ln.len() as u16;
+            s.push_str(format!("{}", termion::cursor::Goto(3, row + 1)).as_str());
+            s.push_str(ln.as_str());
+            s
+        });
+
+    write!(stdout, "{}{}", termion::clear::All, termion::cursor::Goto(1, 3))?;
+    write!(stdout, "╔═FIBS{}╗", String::from("═").repeat(view_width - 5))?;
+
+    for row in 4..26 {
+        write!(stdout, "{}", termion::cursor::Goto(1, row))?;
+        write!(stdout, "║{}║", String::from(" ").repeat(view_width))?;
+    }
+
+    write!(stdout, "{}", termion::cursor::Goto(1, 26))?;
+    write!(stdout, "╚{}╝", String::from("═").repeat(view_width))?;
+
+    write!(stdout, "{}", termion::cursor::Goto(1, 27))?;
+    write!(stdout, "╔═INPUT{}╗", String::from("═").repeat(view_width - 6))?;
+
+    write!(stdout, "{}", termion::cursor::Goto(1, 28))?;
+    write!(stdout, "║ > {}║", String::from(" ").repeat(view_width - 3))?;
+
+    write!(stdout, "{}", termion::cursor::Goto(1, 29))?;
+    write!(stdout, "╚{}╝", String::from("═").repeat(view_width))?;
+
+    write!(stdout, "{}", termion::cursor::Goto(2, 4))?;
+    write!(stdout, "{}", tui_motd)?;
+    io::stdout().flush().unwrap();
+
+    return Ok((col, row + 1));
+}
+
 fn spawn_tui_thread() -> Result<(sync::mpsc::Sender<Update>, thread::JoinHandle<Result<()>>)> {
     let (updates_tx, updates_rx) = sync::mpsc::channel::<Update>();
-    let view_width = 70;
 
     let h = thread::spawn(move || {
         let mut stdout = io::stdout();
-        write!(stdout, "{}{}", termion::clear::All, termion::cursor::Goto(1, 3))?;
-        write!(stdout, "╔═FIBS{}╗", String::from("═").repeat(view_width - 5))?;
-
-        for row in 4..26 {
-            write!(stdout, "{}", termion::cursor::Goto(1, row))?;
-            write!(stdout, "║{}║", String::from(" ").repeat(view_width))?;
-        }
-
-        write!(stdout, "{}", termion::cursor::Goto(1, 26))?;
-        write!(stdout, "╚{}╝", String::from("═").repeat(view_width))?;
-
-        write!(stdout, "{}", termion::cursor::Goto(1, 27))?;
-        write!(stdout, "╔═INPUT{}╗", String::from("═").repeat(view_width - 6))?;
-
-        write!(stdout, "{}", termion::cursor::Goto(1, 28))?;
-        write!(stdout, "║ > {}║", String::from(" ").repeat(view_width - 3))?;
-
-        write!(stdout, "{}", termion::cursor::Goto(1, 29))?;
-        write!(stdout, "╚{}╝", String::from("═").repeat(view_width))?;
 
         // termion's cursor_pos() panics....
         let mut fibs_cursor_pos: (u16, u16) = (3, 4);
         let mut input_cursor_pos: (u16, u16) = (5, 28);
 
         let mut fibs_buffer: Vec<String> = Vec::new();
+        let mut visible_window: (u8, u8) = (0, 22); // closed range [0, 22]
 
         loop {
             let next = updates_rx.recv()?;
@@ -225,36 +248,32 @@ fn spawn_tui_thread() -> Result<(sync::mpsc::Sender<Update>, thread::JoinHandle<
                             b.push(String::from(s));
                             b
                         });
-
-                    let mut row: u16 = 3;
-                    let mut col: u16 = 3;
-                    let tui_motd = fibs_buffer
-                        .into_iter()
-                        .fold(String::new(), |mut s, ln| {
-                            row = row + 1;
-                            col = 3 + ln.len() as u16;
-                            s.push_str(format!("{}", termion::cursor::Goto(3, row + 1)).as_str());
-                            s.push_str(ln.as_str());
-                            s
-                        });
-
-                    write!(stdout, "{}", termion::cursor::Goto(2, 4))?;
-                    write!(stdout, "{}", tui_motd)?;
-                    fibs_cursor_pos = (col, row + 1);
-                    io::stdout().flush().unwrap();
+                    redraw_fibs_buffer(&fibs_buffer.as_slice().iter().collect())?;
                 }
                 Update::AppendChars(s) => {
-                    write!(stdout, "{}", termion::cursor::Goto(fibs_cursor_pos.0, fibs_cursor_pos.1))?;
-                    write!(stdout, "{}", s)?;
-                    fibs_cursor_pos.0 = fibs_cursor_pos.0 + s.len() as u16;
-                    io::stdout().flush().unwrap();
+                    match fibs_buffer.last_mut() {
+                        Some(ref mut last_ln) => { last_ln.push_str(s.as_str()) }
+                        None => { fibs_buffer.push(s); }
+                    }
+                    let fibs_window = fibs_buffer
+                        .as_slice()
+                        .iter()
+                        .skip(visible_window.0 as usize)
+                        .take(visible_window.1 as usize)
+                        .collect();
+                    redraw_fibs_buffer(&fibs_window)?;
                 }
                 Update::AppendLine(s) => {
-                    write!(stdout, "{}", termion::cursor::Goto(3, fibs_cursor_pos.1 + 1))?;
-                    write!(stdout, "{}", s)?;
-                    fibs_cursor_pos.0 = 3;
-                    fibs_cursor_pos.1 = fibs_cursor_pos.1 + 1;
-                    io::stdout().flush().unwrap();
+                    fibs_buffer.push(s);
+                    visible_window.0 = visible_window.0 + 1;
+                    visible_window.1 = visible_window.1 + 1;
+                    let fibs_window = fibs_buffer
+                        .as_slice()
+                        .iter()
+                        .skip(visible_window.0 as usize)
+                        .take(visible_window.1 as usize)
+                        .collect();
+                    redraw_fibs_buffer(&fibs_window)?;
                 }
                 Update::Input(s) => {
                     write!(stdout, "{}", termion::cursor::Goto(input_cursor_pos.0, input_cursor_pos.1))?;
@@ -363,7 +382,7 @@ fn main() -> Result<()> {
                         // hit password prompt...
                         if s == 20 {
                             state.fibs_state = FibsState::WaitPassword;
-                            let update = Update::AppendLine(String::from("\npassword: "));
+                            let update = Update::AppendLine(String::from("password: "));
                             updates_tx.send(update)?;
                             buf.clear();
                         }
