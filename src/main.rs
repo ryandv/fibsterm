@@ -10,13 +10,13 @@ use std::{
     sync,
     net,
     result,
-    thread
+    thread,
+    vec,
 };
 use std::io::prelude::*;
 
 extern crate termion;
 
-use termion::cursor::DetectCursorPos;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 
@@ -38,6 +38,7 @@ struct State {
 enum Update {
     MOTD(String),
     AppendChars(String),
+    AppendLine(String),
     Input(String),
 }
 
@@ -184,64 +185,75 @@ fn spawn_input_thread(mut tcp: net::TcpStream, updates_tx: sync::mpsc::Sender<Up
 
 fn spawn_tui_thread() -> Result<(sync::mpsc::Sender<Update>, thread::JoinHandle<Result<()>>)> {
     let (updates_tx, updates_rx) = sync::mpsc::channel::<Update>();
-    let view_width = 80;
+    let view_width = 70;
 
     let h = thread::spawn(move || {
         let mut stdout = io::stdout();
         write!(stdout, "{}{}", termion::clear::All, termion::cursor::Goto(1, 3))?;
         write!(stdout, "╔═FIBS{}╗", String::from("═").repeat(view_width - 5))?;
 
-        for row in 4..25 {
+        for row in 4..26 {
             write!(stdout, "{}", termion::cursor::Goto(1, row))?;
             write!(stdout, "║{}║", String::from(" ").repeat(view_width))?;
         }
 
-        write!(stdout, "{}", termion::cursor::Goto(1, 25))?;
+        write!(stdout, "{}", termion::cursor::Goto(1, 26))?;
         write!(stdout, "╚{}╝", String::from("═").repeat(view_width))?;
 
-        write!(stdout, "{}", termion::cursor::Goto(1, 26))?;
+        write!(stdout, "{}", termion::cursor::Goto(1, 27))?;
         write!(stdout, "╔═INPUT{}╗", String::from("═").repeat(view_width - 6))?;
 
-        write!(stdout, "{}", termion::cursor::Goto(1, 27))?;
+        write!(stdout, "{}", termion::cursor::Goto(1, 28))?;
         write!(stdout, "║ > {}║", String::from(" ").repeat(view_width - 3))?;
 
-        write!(stdout, "{}", termion::cursor::Goto(1, 28))?;
+        write!(stdout, "{}", termion::cursor::Goto(1, 29))?;
         write!(stdout, "╚{}╝", String::from("═").repeat(view_width))?;
 
         // termion's cursor_pos() panics....
         let mut fibs_cursor_pos: (u16, u16) = (3, 4);
-        let mut input_cursor_pos: (u16, u16) = (5, 27);
+        let mut input_cursor_pos: (u16, u16) = (5, 28);
+
+        let mut fibs_buffer: Vec<String> = Vec::new();
 
         loop {
             let next = updates_rx.recv()?;
             match next {
                 Update::MOTD(motd) => {
-                    let mut row = 4;
-                    let tui_motd: String = motd
-                        .chars()
-                        .fold(String::new(), |mut s, c| {
-                            if c == '\r' {
-                                s.extend(format!("{}", termion::cursor::Goto(3, row)).chars());
-                                fibs_cursor_pos.0 = 3;
-                            } else if c == '\n' {
-                                s.extend(format!("{}", termion::cursor::Down(1)).chars());
-                                row = row + 1;
-                                fibs_cursor_pos.1 = fibs_cursor_pos.1 + 1;
-                            } else {
-                                fibs_cursor_pos.0 = fibs_cursor_pos.0 + 1;
-                                s.push(c);
-                            }
+                    fibs_buffer = motd
+                        .split("\r\n")
+                        .fold(Vec::<String>::new(), |mut b, s| {
+                            b.push(String::from(s));
+                            b
+                        });
+
+                    let mut row: u16 = 3;
+                    let mut col: u16 = 3;
+                    let tui_motd = fibs_buffer
+                        .into_iter()
+                        .fold(String::new(), |mut s, ln| {
+                            row = row + 1;
+                            col = 3 + ln.len() as u16;
+                            s.push_str(format!("{}", termion::cursor::Goto(3, row + 1)).as_str());
+                            s.push_str(ln.as_str());
                             s
                         });
 
                     write!(stdout, "{}", termion::cursor::Goto(2, 4))?;
                     write!(stdout, "{}", tui_motd)?;
+                    fibs_cursor_pos = (col, row + 1);
                     io::stdout().flush().unwrap();
                 }
                 Update::AppendChars(s) => {
                     write!(stdout, "{}", termion::cursor::Goto(fibs_cursor_pos.0, fibs_cursor_pos.1))?;
                     write!(stdout, "{}", s)?;
                     fibs_cursor_pos.0 = fibs_cursor_pos.0 + s.len() as u16;
+                    io::stdout().flush().unwrap();
+                }
+                Update::AppendLine(s) => {
+                    write!(stdout, "{}", termion::cursor::Goto(3, fibs_cursor_pos.1 + 1))?;
+                    write!(stdout, "{}", s)?;
+                    fibs_cursor_pos.0 = 3;
+                    fibs_cursor_pos.1 = fibs_cursor_pos.1 + 1;
                     io::stdout().flush().unwrap();
                 }
                 Update::Input(s) => {
@@ -279,7 +291,7 @@ fn main() -> Result<()> {
         fibs_state: FibsState::MOTD,
     };
 
-    let mut buf = collections::VecDeque::with_capacity(4096);
+    let mut buf = vec::Vec::with_capacity(4096);
 
     let mut delta = collections::HashMap::<u8, (u8, collections::HashMap::<u8, u8>)>::new();
 
@@ -322,7 +334,7 @@ fn main() -> Result<()> {
                     FibsState::MOTD => {
                         // chomp leading whitespace...
                         if s > 1 {
-                            buf.push_back(b);
+                            buf.push(b);
                         }
 
                         s = delta
@@ -335,7 +347,7 @@ fn main() -> Result<()> {
                         if s == 10 {
                             state.fibs_state = FibsState::WaitLogin;
 
-                            let update = Update::MOTD(String::from_utf8_lossy(buf.make_contiguous()).into_owned());
+                            let update = Update::MOTD(String::from_utf8_lossy(buf.as_slice()).into_owned());
                             updates_tx.send(update)?;
 
                             buf.clear();
@@ -351,7 +363,7 @@ fn main() -> Result<()> {
                         // hit password prompt...
                         if s == 20 {
                             state.fibs_state = FibsState::WaitPassword;
-                            let update = Update::AppendChars(String::from("\npassword: "));
+                            let update = Update::AppendLine(String::from("\npassword: "));
                             updates_tx.send(update)?;
                             buf.clear();
                         }
