@@ -183,6 +183,7 @@ fn spawn_input_thread(mut tcp: net::TcpStream, updates_tx: sync::mpsc::Sender<Up
     }))
 }
 
+// doesn't do overflow checking, text may escape container...?
 fn redraw_fibs_buffer(fibs_buffer: &Vec<&String>) -> Result<(u16, u16)> {
     let mut stdout = io::stdout();
     let view_width = 73;
@@ -193,33 +194,23 @@ fn redraw_fibs_buffer(fibs_buffer: &Vec<&String>) -> Result<(u16, u16)> {
         .fold(String::new(), |mut s, ln| {
             row = row + 1;
             col = 3 + ln.len() as u16;
-            s.push_str(format!("{}", termion::cursor::Goto(3, row + 1)).as_str());
+            s.push_str(format!("{}", termion::cursor::Goto(4, row + 1)).as_str());
             s.push_str(ln.as_str());
             s
         });
 
-    write!(stdout, "{}{}", termion::clear::All, termion::cursor::Goto(1, 3))?;
+    write!(stdout, "{}{}{}", termion::cursor::Goto(2, 27), termion::clear::BeforeCursor, termion::cursor::Goto(2, 3))?;
     write!(stdout, "╔═FIBS{}╗", String::from("═").repeat(view_width - 5))?;
 
     for row in 4..26 {
-        write!(stdout, "{}", termion::cursor::Goto(1, row))?;
+        write!(stdout, "{}", termion::cursor::Goto(2, row))?;
         write!(stdout, "║{}║", String::from(" ").repeat(view_width))?;
     }
 
-    write!(stdout, "{}", termion::cursor::Goto(1, 26))?;
+    write!(stdout, "{}", termion::cursor::Goto(2, 26))?;
     write!(stdout, "╚{}╝", String::from("═").repeat(view_width))?;
 
-    write!(stdout, "{}", termion::cursor::Goto(1, 27))?;
-    write!(stdout, "╔═INPUT{}╗", String::from("═").repeat(view_width - 6))?;
-
-    write!(stdout, "{}", termion::cursor::Goto(1, 28))?;
-    write!(stdout, "║ > {}║", String::from(" ").repeat(view_width - 3))?;
-
-    write!(stdout, "{}", termion::cursor::Goto(1, 29))?;
-    write!(stdout, "╚{}╝", String::from("═").repeat(view_width))?;
-
-    write!(stdout, "{}", termion::cursor::Goto(2, 4))?;
-    write!(stdout, "{}", tui_motd)?;
+    write!(stdout, "{}{}", termion::cursor::Goto(3, 4), tui_motd)?;
     io::stdout().flush().unwrap();
 
     return Ok((col, row + 1));
@@ -230,13 +221,23 @@ fn spawn_tui_thread() -> Result<(sync::mpsc::Sender<Update>, thread::JoinHandle<
 
     let h = thread::spawn(move || {
         let mut stdout = io::stdout();
+        let view_width = 73;
 
         // termion's cursor_pos() panics....
-        let mut fibs_cursor_pos: (u16, u16) = (3, 4);
-        let mut input_cursor_pos: (u16, u16) = (5, 28);
+        let mut fibs_cursor_pos: (u16, u16) = (4, 4);
+        let mut input_cursor_pos: (u16, u16) = (6, 29);
 
         let mut fibs_buffer: Vec<String> = Vec::new();
         let mut visible_window: (u8, u8) = (0, 22); // closed range [0, 22]
+
+        write!(stdout, "{}{}", termion::clear::All, termion::cursor::Goto(2, 28))?;
+        write!(stdout, "╔═INPUT{}╗", String::from("═").repeat(view_width - 6))?;
+
+        write!(stdout, "{}", termion::cursor::Goto(2, 29))?;
+        write!(stdout, "║ > {}║", String::from(" ").repeat(view_width - 3))?;
+
+        write!(stdout, "{}", termion::cursor::Goto(2, 30))?;
+        write!(stdout, "╚{}╝", String::from("═").repeat(view_width))?;
 
         loop {
             let next = updates_rx.recv()?;
@@ -259,7 +260,7 @@ fn spawn_tui_thread() -> Result<(sync::mpsc::Sender<Update>, thread::JoinHandle<
                         .as_slice()
                         .iter()
                         .skip(visible_window.0 as usize)
-                        .take(visible_window.1 as usize)
+                        .take((visible_window.1 - visible_window.0) as usize)
                         .collect();
                     redraw_fibs_buffer(&fibs_window)?;
                 }
@@ -271,7 +272,7 @@ fn spawn_tui_thread() -> Result<(sync::mpsc::Sender<Update>, thread::JoinHandle<
                         .as_slice()
                         .iter()
                         .skip(visible_window.0 as usize)
-                        .take(visible_window.1 as usize)
+                        .take((visible_window.1 - visible_window.0) as usize)
                         .collect();
                     redraw_fibs_buffer(&fibs_window)?;
                 }
